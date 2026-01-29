@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mps-deform-conv"
-version = "0.1.0"
+version = "0.1.1"
 description = "Deformable Convolution 2D for PyTorch on Apple Silicon (MPS)"
 readme = "README.md"
 license = "MIT"
@@ -29,9 +29,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/imperatormk/mps-deform-conv"
-Repository = "https://github.com/imperatormk/mps-deform-conv"
-Issues = "https://github.com/imperatormk/mps-deform-conv/issues"
+Homepage = "https://github.com/mpsops/mps-deform-conv"
+Repository = "https://github.com/mpsops/mps-deform-conv"
+Issues = "https://github.com/mpsops/mps-deform-conv/issues"
 
 [tool.setuptools]
 packages = ["mps_deform_conv"]
