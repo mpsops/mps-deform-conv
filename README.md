@@ -27,7 +27,7 @@ pip install mps-deform-conv
 Or from source:
 
 ```bash
-git clone https://github.com/imperatormk/mps-deform-conv
+git clone https://github.com/mpsops/mps-deform-conv
 cd mps-deform-conv
 pip install -e .
 ```
