@@ -10,7 +10,7 @@ from torch import nn, Tensor
 from typing import Optional, Tuple
 import math
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 def _load_library():

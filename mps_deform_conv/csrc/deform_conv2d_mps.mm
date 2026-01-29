@@ -510,12 +510,10 @@ at::Tensor deform_conv2d_forward_mps(
     auto offset_contig = offset.contiguous();
     auto mask_contig = mask_tensor.contiguous();
 
+    // Use MPS stream with PyTorch's shared encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
-
-        id<MTLCommandBuffer> cmdBuffer = [stream->commandQueue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         bool use_fp16 = input.scalar_type() == at::kHalf;
         auto pipeline = use_fp16 ? g_im2col_fp16 : g_im2col_fp32;
@@ -573,9 +571,7 @@ at::Tensor deform_conv2d_forward_mps(
         MTLSize gridSize = MTLSizeMake((num_kernels + 255) / 256 * 256, 1, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
-        [encoder endEncoding];
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
+        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     // Reshape columns and perform matrix multiplication with weights
@@ -657,12 +653,10 @@ at::Tensor deformable_im2col_mps(
     auto offset_contig = offset.contiguous();
     auto mask_contig = mask_tensor.contiguous();
 
+    // Use MPS stream with PyTorch's shared encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
-
-        id<MTLCommandBuffer> cmdBuffer = [stream->commandQueue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         bool use_fp16 = input.scalar_type() == at::kHalf;
         auto pipeline = use_fp16 ? g_im2col_fp16 : g_im2col_fp32;
@@ -717,9 +711,7 @@ at::Tensor deformable_im2col_mps(
         MTLSize gridSize = MTLSizeMake((num_kernels + 255) / 256 * 256, 1, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
-        [encoder endEncoding];
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
+        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return columns;
@@ -764,12 +756,10 @@ at::Tensor deform_conv2d_backward_input_mps(
     auto offset_contig = offset.contiguous();
     auto mask_contig = mask_tensor.contiguous();
 
+    // Use MPS stream with PyTorch's shared encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
-
-        id<MTLCommandBuffer> cmdBuffer = [stream->commandQueue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         [encoder setComputePipelineState:g_col2im_fp32];
 
@@ -822,9 +812,7 @@ at::Tensor deform_conv2d_backward_input_mps(
         MTLSize gridSize = MTLSizeMake((num_kernels + 255) / 256 * 256, 1, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
-        [encoder endEncoding];
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
+        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return grad_input;
@@ -871,12 +859,10 @@ std::tuple<at::Tensor, at::Tensor> deform_conv2d_backward_offset_mask_mps(
     auto offset_contig = offset.contiguous();
     auto mask_contig = mask_tensor.contiguous();
 
+    // Use MPS stream with PyTorch's shared encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
-
-        id<MTLCommandBuffer> cmdBuffer = [stream->commandQueue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         [encoder setComputePipelineState:g_col2im_coord_fp32];
 
@@ -937,9 +923,7 @@ std::tuple<at::Tensor, at::Tensor> deform_conv2d_backward_offset_mask_mps(
         MTLSize gridSize = MTLSizeMake((num_kernels + 255) / 256 * 256, 1, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
-        [encoder endEncoding];
-        [cmdBuffer commit];
-        [cmdBuffer waitUntilCompleted];
+        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return std::make_tuple(grad_offset, grad_mask);
