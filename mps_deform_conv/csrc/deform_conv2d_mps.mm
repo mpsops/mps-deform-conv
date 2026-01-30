@@ -22,6 +22,7 @@ static id<MTLComputePipelineState> g_im2col_fp32 = nil;
 static id<MTLComputePipelineState> g_im2col_fp16 = nil;
 static id<MTLComputePipelineState> g_col2im_fp32 = nil;
 static id<MTLComputePipelineState> g_col2im_coord_fp32 = nil;
+// Note: No FP16 backward kernels - Metal doesn't have atomic_half, so we use FP32 for backward
 
 static NSString* get_metal_source() {
     return @R"(
@@ -312,6 +313,9 @@ kernel void deformable_col2im_fp32(
     }
 }
 
+// Note: No FP16/BF16 backward kernels - Metal lacks atomic_half
+// Backward pass always uses FP32 kernels, converting inputs/outputs as needed
+
 // Backward: gradient for offsets and mask
 kernel void deformable_col2im_coord_fp32(
     device const float* col         [[buffer(0)]],
@@ -451,6 +455,7 @@ static bool init_metal() {
         g_im2col_fp16 = create_pipeline(@"deformable_im2col_fp16");
         g_col2im_fp32 = create_pipeline(@"deformable_col2im_fp32");
         g_col2im_coord_fp32 = create_pipeline(@"deformable_col2im_coord_fp32");
+        // No FP16 backward kernels - use FP32 and convert
     }
 
     return true;
@@ -506,16 +511,33 @@ at::Tensor deform_conv2d_forward_mps(
         );
     }
 
+    // Handle BF16: convert to FP32 for kernel, convert output back
+    bool is_bfloat16 = input.scalar_type() == at::kBFloat16;
+    at::ScalarType orig_dtype = input.scalar_type();
+
     auto input_contig = input.contiguous();
     auto offset_contig = offset.contiguous();
     auto mask_contig = mask_tensor.contiguous();
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Convert BF16 to FP32 for kernel execution
+    if (is_bfloat16) {
+        input_contig = input_contig.to(at::kFloat);
+        offset_contig = offset_contig.to(at::kFloat);
+        mask_contig = mask_contig.to(at::kFloat);
+        // Reallocate columns in FP32
+        columns = at::empty(
+            {n_in_channels * weight_h * weight_w, batch_sz * out_h * out_w},
+            input_contig.options()
+        );
+    }
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        bool use_fp16 = input.scalar_type() == at::kHalf;
+        // Select kernel based on dtype (BF16 already converted to FP32 above)
+        bool use_fp16 = input_contig.scalar_type() == at::kHalf;
         auto pipeline = use_fp16 ? g_im2col_fp16 : g_im2col_fp32;
         [encoder setComputePipelineState:pipeline];
 
@@ -525,10 +547,10 @@ at::Tensor deform_conv2d_forward_mps(
         id<MTLBuffer> mask_buf = at::native::mps::getMTLBufferStorage(mask_contig);
         id<MTLBuffer> columns_buf = at::native::mps::getMTLBufferStorage(columns);
 
-        [encoder setBuffer:input_buf offset:0 atIndex:0];
-        [encoder setBuffer:offset_buf offset:0 atIndex:1];
-        [encoder setBuffer:mask_buf offset:0 atIndex:2];
-        [encoder setBuffer:columns_buf offset:0 atIndex:3];
+        [encoder setBuffer:input_buf offset:input_contig.storage_offset() * input_contig.element_size() atIndex:0];
+        [encoder setBuffer:offset_buf offset:offset_contig.storage_offset() * offset_contig.element_size() atIndex:1];
+        [encoder setBuffer:mask_buf offset:mask_contig.storage_offset() * mask_contig.element_size() atIndex:2];
+        [encoder setBuffer:columns_buf offset:columns.storage_offset() * columns.element_size() atIndex:3];
 
         // Set constants
         int32_t height = static_cast<int32_t>(in_h);
@@ -571,14 +593,16 @@ at::Tensor deform_conv2d_forward_mps(
         MTLSize gridSize = MTLSizeMake((num_kernels + 255) / 256 * 256, 1, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     // Reshape columns and perform matrix multiplication with weights
     // columns: [n_in_channels * weight_h * weight_w, batch_sz * out_h * out_w]
     // weight: [n_out_channels, n_in_channels / n_weight_grps, weight_h, weight_w]
 
-    auto weight_flat = weight.view({n_out_channels, -1});  // [out_ch, in_ch * kh * kw]
+    // For BF16, weight also needs to be converted to match columns dtype
+    auto weight_for_mm = is_bfloat16 ? weight.to(at::kFloat) : weight;
+    auto weight_flat = weight_for_mm.view({n_out_channels, -1});  // [out_ch, in_ch * kh * kw]
 
     // Perform grouped matmul if needed
     at::Tensor output;
@@ -604,7 +628,13 @@ at::Tensor deform_conv2d_forward_mps(
 
     // Add bias
     if (bias.defined() && bias.numel() > 0) {
-        output = output + bias.view({1, -1, 1, 1});
+        auto bias_for_add = is_bfloat16 ? bias.to(at::kFloat) : bias;
+        output = output + bias_for_add.view({1, -1, 1, 1});
+    }
+
+    // Convert output back to original dtype (BF16)
+    if (is_bfloat16) {
+        output = output.to(orig_dtype);
     }
 
     return output;
@@ -637,40 +667,51 @@ at::Tensor deformable_im2col_mps(
     const int64_t out_h = (in_h + 2 * pad_h - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
     const int64_t out_w = (in_w + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
 
-    // Allocate columns
-    auto columns = at::empty(
-        {n_in_channels * kernel_h * kernel_w, batch_sz * out_h * out_w},
-        input.options()
-    );
+    // Handle BF16: convert to FP32 for kernel
+    bool is_bfloat16 = input.scalar_type() == at::kBFloat16;
+    at::ScalarType orig_dtype = input.scalar_type();
+
+    auto input_work = input.contiguous();
+    auto offset_work = offset.contiguous();
 
     // Handle mask
     at::Tensor mask_tensor = mask;
     if (!use_mask || mask.numel() == 0) {
         mask_tensor = at::ones({batch_sz, n_offset_grps, kernel_h, kernel_w, out_h, out_w}, input.options());
     }
+    auto mask_work = mask_tensor.contiguous();
 
-    auto input_contig = input.contiguous();
-    auto offset_contig = offset.contiguous();
-    auto mask_contig = mask_tensor.contiguous();
+    // Convert BF16 to FP32 for kernel execution
+    if (is_bfloat16) {
+        input_work = input_work.to(at::kFloat);
+        offset_work = offset_work.to(at::kFloat);
+        mask_work = mask_work.to(at::kFloat);
+    }
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Allocate columns in working dtype
+    auto columns = at::empty(
+        {n_in_channels * kernel_h * kernel_w, batch_sz * out_h * out_w},
+        input_work.options()
+    );
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        bool use_fp16 = input.scalar_type() == at::kHalf;
+        bool use_fp16 = input_work.scalar_type() == at::kHalf;
         auto pipeline = use_fp16 ? g_im2col_fp16 : g_im2col_fp32;
         [encoder setComputePipelineState:pipeline];
 
-        id<MTLBuffer> input_buf = at::native::mps::getMTLBufferStorage(input_contig);
-        id<MTLBuffer> offset_buf = at::native::mps::getMTLBufferStorage(offset_contig);
-        id<MTLBuffer> mask_buf = at::native::mps::getMTLBufferStorage(mask_contig);
+        id<MTLBuffer> input_buf = at::native::mps::getMTLBufferStorage(input_work);
+        id<MTLBuffer> offset_buf = at::native::mps::getMTLBufferStorage(offset_work);
+        id<MTLBuffer> mask_buf = at::native::mps::getMTLBufferStorage(mask_work);
         id<MTLBuffer> columns_buf = at::native::mps::getMTLBufferStorage(columns);
 
-        [encoder setBuffer:input_buf offset:0 atIndex:0];
-        [encoder setBuffer:offset_buf offset:0 atIndex:1];
-        [encoder setBuffer:mask_buf offset:0 atIndex:2];
-        [encoder setBuffer:columns_buf offset:0 atIndex:3];
+        [encoder setBuffer:input_buf offset:input_work.storage_offset() * input_work.element_size() atIndex:0];
+        [encoder setBuffer:offset_buf offset:offset_work.storage_offset() * offset_work.element_size() atIndex:1];
+        [encoder setBuffer:mask_buf offset:mask_work.storage_offset() * mask_work.element_size() atIndex:2];
+        [encoder setBuffer:columns_buf offset:columns.storage_offset() * columns.element_size() atIndex:3];
 
         int32_t height = static_cast<int32_t>(in_h);
         int32_t width = static_cast<int32_t>(in_w);
@@ -711,7 +752,12 @@ at::Tensor deformable_im2col_mps(
         MTLSize gridSize = MTLSizeMake((num_kernels + 255) / 256 * 256, 1, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
+    }
+
+    // Convert back to original dtype if needed
+    if (is_bfloat16) {
+        columns = columns.to(orig_dtype);
     }
 
     return columns;
@@ -743,8 +789,10 @@ at::Tensor deform_conv2d_backward_input_mps(
     const int64_t out_h = (in_h + 2 * pad_h - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
     const int64_t out_w = (in_w + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
 
-    // Allocate grad_input
-    auto grad_input = at::zeros({batch_sz, n_in_channels, in_h, in_w}, input.options());
+    // Backward always uses FP32 kernel (Metal doesn't have atomic_half)
+    // Convert FP16/BF16 inputs to FP32, run kernel, convert output back
+    at::ScalarType orig_dtype = input.scalar_type();
+    bool need_convert = (orig_dtype == at::kHalf || orig_dtype == at::kBFloat16);
 
     // Handle mask
     at::Tensor mask_tensor = mask;
@@ -752,26 +800,37 @@ at::Tensor deform_conv2d_backward_input_mps(
         mask_tensor = at::ones({batch_sz, n_offset_grps, kernel_h, kernel_w, out_h, out_w}, input.options());
     }
 
-    auto grad_col_contig = grad_col.contiguous();
-    auto offset_contig = offset.contiguous();
-    auto mask_contig = mask_tensor.contiguous();
+    auto grad_col_work = grad_col.contiguous();
+    auto offset_work = offset.contiguous();
+    auto mask_work = mask_tensor.contiguous();
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Convert to FP32 for kernel
+    if (need_convert) {
+        grad_col_work = grad_col_work.to(at::kFloat);
+        offset_work = offset_work.to(at::kFloat);
+        mask_work = mask_work.to(at::kFloat);
+    }
+
+    // Allocate grad_input in FP32
+    auto grad_input = at::zeros({batch_sz, n_in_channels, in_h, in_w}, grad_col_work.options());
+
+    // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
+    id<MTLBuffer> col_buf = at::native::mps::getMTLBufferStorage(grad_col_work);
+    id<MTLBuffer> offset_buf = at::native::mps::getMTLBufferStorage(offset_work);
+    id<MTLBuffer> mask_buf = at::native::mps::getMTLBufferStorage(mask_work);
+    id<MTLBuffer> grad_im_buf = at::native::mps::getMTLBufferStorage(grad_input);
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         [encoder setComputePipelineState:g_col2im_fp32];
 
-        id<MTLBuffer> col_buf = at::native::mps::getMTLBufferStorage(grad_col_contig);
-        id<MTLBuffer> offset_buf = at::native::mps::getMTLBufferStorage(offset_contig);
-        id<MTLBuffer> mask_buf = at::native::mps::getMTLBufferStorage(mask_contig);
-        id<MTLBuffer> grad_im_buf = at::native::mps::getMTLBufferStorage(grad_input);
-
-        [encoder setBuffer:col_buf offset:0 atIndex:0];
-        [encoder setBuffer:offset_buf offset:0 atIndex:1];
-        [encoder setBuffer:mask_buf offset:0 atIndex:2];
-        [encoder setBuffer:grad_im_buf offset:0 atIndex:3];
+        [encoder setBuffer:col_buf offset:grad_col_work.storage_offset() * grad_col_work.element_size() atIndex:0];
+        [encoder setBuffer:offset_buf offset:offset_work.storage_offset() * offset_work.element_size() atIndex:1];
+        [encoder setBuffer:mask_buf offset:mask_work.storage_offset() * mask_work.element_size() atIndex:2];
+        [encoder setBuffer:grad_im_buf offset:grad_input.storage_offset() * grad_input.element_size() atIndex:3];
 
         int32_t channels_val = static_cast<int32_t>(n_in_channels);
         int32_t height_val = static_cast<int32_t>(in_h);
@@ -812,7 +871,12 @@ at::Tensor deform_conv2d_backward_input_mps(
         MTLSize gridSize = MTLSizeMake((num_kernels + 255) / 256 * 256, 1, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
+    }
+
+    // Convert back to original dtype
+    if (need_convert) {
+        grad_input = grad_input.to(orig_dtype);
     }
 
     return grad_input;
@@ -844,9 +908,9 @@ std::tuple<at::Tensor, at::Tensor> deform_conv2d_backward_offset_mask_mps(
     const int64_t out_h = (in_h + 2 * pad_h - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
     const int64_t out_w = (in_w + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
 
-    // Allocate gradients
-    auto grad_offset = at::zeros_like(offset);
-    auto grad_mask = use_mask ? at::zeros_like(mask) : at::empty({0}, input.options());
+    // Backward always uses FP32 kernel
+    at::ScalarType orig_dtype = input.scalar_type();
+    bool need_convert = (orig_dtype == at::kHalf || orig_dtype == at::kBFloat16);
 
     // Handle mask
     at::Tensor mask_tensor = mask;
@@ -854,34 +918,47 @@ std::tuple<at::Tensor, at::Tensor> deform_conv2d_backward_offset_mask_mps(
         mask_tensor = at::ones({batch_sz, n_offset_grps, kernel_h, kernel_w, out_h, out_w}, input.options());
     }
 
-    auto grad_col_contig = grad_col.contiguous();
-    auto input_contig = input.contiguous();
-    auto offset_contig = offset.contiguous();
-    auto mask_contig = mask_tensor.contiguous();
+    auto grad_col_work = grad_col.contiguous();
+    auto input_work = input.contiguous();
+    auto offset_work = offset.contiguous();
+    auto mask_work = mask_tensor.contiguous();
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Convert to FP32 for kernel
+    if (need_convert) {
+        grad_col_work = grad_col_work.to(at::kFloat);
+        input_work = input_work.to(at::kFloat);
+        offset_work = offset_work.to(at::kFloat);
+        mask_work = mask_work.to(at::kFloat);
+    }
+
+    // Allocate gradients in FP32
+    auto grad_offset = at::zeros_like(offset_work);
+    auto grad_mask = use_mask ? at::zeros_like(mask_work) : at::empty({0}, input_work.options());
+
+    // Create dummy buffer for grad_mask if not using mask
+    at::Tensor grad_mask_tensor = use_mask ? grad_mask : at::zeros({1}, input_work.options());
+
+    // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
+    id<MTLBuffer> col_buf = at::native::mps::getMTLBufferStorage(grad_col_work);
+    id<MTLBuffer> im_buf = at::native::mps::getMTLBufferStorage(input_work);
+    id<MTLBuffer> offset_buf = at::native::mps::getMTLBufferStorage(offset_work);
+    id<MTLBuffer> mask_buf = at::native::mps::getMTLBufferStorage(mask_work);
+    id<MTLBuffer> grad_offset_buf = at::native::mps::getMTLBufferStorage(grad_offset);
+    id<MTLBuffer> grad_mask_buf = at::native::mps::getMTLBufferStorage(grad_mask_tensor);
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         [encoder setComputePipelineState:g_col2im_coord_fp32];
 
-        id<MTLBuffer> col_buf = at::native::mps::getMTLBufferStorage(grad_col_contig);
-        id<MTLBuffer> im_buf = at::native::mps::getMTLBufferStorage(input_contig);
-        id<MTLBuffer> offset_buf = at::native::mps::getMTLBufferStorage(offset_contig);
-        id<MTLBuffer> mask_buf = at::native::mps::getMTLBufferStorage(mask_contig);
-        id<MTLBuffer> grad_offset_buf = at::native::mps::getMTLBufferStorage(grad_offset);
-
-        // Create dummy buffer for grad_mask if not using mask
-        at::Tensor grad_mask_tensor = use_mask ? grad_mask : at::zeros({1}, input.options());
-        id<MTLBuffer> grad_mask_buf = at::native::mps::getMTLBufferStorage(grad_mask_tensor);
-
-        [encoder setBuffer:col_buf offset:0 atIndex:0];
-        [encoder setBuffer:im_buf offset:0 atIndex:1];
-        [encoder setBuffer:offset_buf offset:0 atIndex:2];
-        [encoder setBuffer:mask_buf offset:0 atIndex:3];
-        [encoder setBuffer:grad_offset_buf offset:0 atIndex:4];
-        [encoder setBuffer:grad_mask_buf offset:0 atIndex:5];
+        [encoder setBuffer:col_buf offset:grad_col_work.storage_offset() * grad_col_work.element_size() atIndex:0];
+        [encoder setBuffer:im_buf offset:input_work.storage_offset() * input_work.element_size() atIndex:1];
+        [encoder setBuffer:offset_buf offset:offset_work.storage_offset() * offset_work.element_size() atIndex:2];
+        [encoder setBuffer:mask_buf offset:mask_work.storage_offset() * mask_work.element_size() atIndex:3];
+        [encoder setBuffer:grad_offset_buf offset:grad_offset.storage_offset() * grad_offset.element_size() atIndex:4];
+        [encoder setBuffer:grad_mask_buf offset:grad_mask_tensor.storage_offset() * grad_mask_tensor.element_size() atIndex:5];
 
         int32_t channels_val = static_cast<int32_t>(n_in_channels);
         int32_t height_val = static_cast<int32_t>(in_h);
@@ -923,7 +1000,15 @@ std::tuple<at::Tensor, at::Tensor> deform_conv2d_backward_offset_mask_mps(
         MTLSize gridSize = MTLSizeMake((num_kernels + 255) / 256 * 256, 1, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
+    }
+
+    // Convert back to original dtype
+    if (need_convert) {
+        grad_offset = grad_offset.to(orig_dtype);
+        if (use_mask) {
+            grad_mask = grad_mask.to(orig_dtype);
+        }
     }
 
     return std::make_tuple(grad_offset, grad_mask);
