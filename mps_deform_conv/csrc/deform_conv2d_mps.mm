@@ -29,6 +29,23 @@ static NSString* get_metal_source() {
 #include <metal_stdlib>
 using namespace metal;
 
+// Atomic float add using compare-and-swap (works on all Metal versions)
+// This is the standard workaround when atomic_float is not available
+inline void atomic_add_float(device atomic_uint* addr, float value) {
+    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+    float current_val = as_type<float>(expected);
+    float new_val = current_val + value;
+    uint new_bits = as_type<uint>(new_val);
+
+    while (!atomic_compare_exchange_weak_explicit(
+        addr, &expected, new_bits,
+        memory_order_relaxed, memory_order_relaxed)) {
+        current_val = as_type<float>(expected);
+        new_val = current_val + value;
+        new_bits = as_type<uint>(new_val);
+    }
+}
+
 // Bilinear interpolation
 template<typename T>
 inline T bilinear_interpolate(
@@ -238,11 +255,12 @@ kernel void deformable_im2col_fp16(
 }
 
 // Backward: col2im for input gradients
+// Uses atomic_uint with CAS loop for compatibility with all Metal versions
 kernel void deformable_col2im_fp32(
     device const float* col         [[buffer(0)]],
     device const float* offset      [[buffer(1)]],
     device const float* mask        [[buffer(2)]],
-    device atomic_float* grad_im    [[buffer(3)]],
+    device atomic_uint* grad_im     [[buffer(3)]],
     constant int& channels          [[buffer(4)]],
     constant int& height            [[buffer(5)]],
     constant int& width             [[buffer(6)]],
@@ -307,7 +325,7 @@ kernel void deformable_col2im_fp32(
                 int grad_pos = ((b * channels + c) * height + yp) * width + xp;
                 float weight = (1.0f - abs(y - float(yp))) * (1.0f - abs(x - float(xp)));
 
-                atomic_fetch_add_explicit(&grad_im[grad_pos], mask_value * weight * col_val, memory_order_relaxed);
+                atomic_add_float(&grad_im[grad_pos], mask_value * weight * col_val);
             }
         }
     }

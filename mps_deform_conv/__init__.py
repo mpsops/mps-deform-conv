@@ -10,7 +10,7 @@ from torch import nn, Tensor
 from typing import Optional, Tuple
 import math
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 
 def _load_library():
@@ -62,6 +62,14 @@ class _DeformConv2dFunction(torch.autograd.Function):
         use_mask: bool,
     ) -> Tensor:
         lib = _get_lib()
+
+        # Handle int or tuple for stride/padding/dilation (torchvision compatibility)
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        if isinstance(padding, int):
+            padding = (padding, padding)
+        if isinstance(dilation, int):
+            dilation = (dilation, dilation)
 
         stride_h, stride_w = stride
         pad_h, pad_w = padding

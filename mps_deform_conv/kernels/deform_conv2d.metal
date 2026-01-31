@@ -9,6 +9,23 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Atomic float add using compare-and-swap (works on all Metal versions)
+// This is the standard workaround when atomic_float is not available
+inline void atomic_add_float(device atomic_uint* addr, float value) {
+    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+    float current_val = as_type<float>(expected);
+    float new_val = current_val + value;
+    uint new_bits = as_type<uint>(new_val);
+
+    while (!atomic_compare_exchange_weak_explicit(
+        addr, &expected, new_bits,
+        memory_order_relaxed, memory_order_relaxed)) {
+        current_val = as_type<float>(expected);
+        new_val = current_val + value;
+        new_bits = as_type<uint>(new_val);
+    }
+}
+
 // =============================================================================
 // Bilinear Interpolation
 // =============================================================================
@@ -322,12 +339,8 @@ kernel void deformable_col2im_fp32(
                 int grad_pos = ((b * channels + c) * height + yp) * width + xp;
                 float weight = (1.0f - abs(y - float(yp))) * (1.0f - abs(x - float(xp)));
 
-                // Atomic add for thread safety
-                atomic_fetch_add_explicit(
-                    (device atomic_float*)&grad_im[grad_pos],
-                    mask_value * weight * col_val,
-                    memory_order_relaxed
-                );
+                // Atomic add for thread safety (CAS-based for Metal compatibility)
+                atomic_add_float((device atomic_uint*)&grad_im[grad_pos], mask_value * weight * col_val);
             }
         }
     }
