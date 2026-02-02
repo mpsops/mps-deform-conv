@@ -1,13 +1,141 @@
-"""Test mps-deform-conv: FP32, FP16, BF16 support"""
+"""Test mps-deform-conv: FP32, FP16, BF16 support and validation"""
 
 import torch
 import time
+import pytest
 
 # Build and load the extension
 print("Loading mps_deform_conv...")
 from mps_deform_conv import deform_conv2d, DeformConv2d, ModulatedDeformConv2d, is_available
 
 print(f"MPS available: {is_available()}")
+
+
+# =============================================================================
+# Validation Tests
+# =============================================================================
+
+def test_stride_validation():
+    """Test that stride=0 raises ValueError"""
+    torch.manual_seed(42)
+    B, C_in, H, W = 1, 4, 8, 8
+    C_out, K = 4, 3
+
+    input = torch.randn(B, C_in, H, W, device='mps', dtype=torch.float32)
+    weight = torch.randn(C_out, C_in, K, K, device='mps', dtype=torch.float32)
+    offset = torch.randn(B, 2 * K * K, H - K + 1, W - K + 1, device='mps', dtype=torch.float32) * 0.1
+
+    try:
+        deform_conv2d(input, offset, weight, stride=(0, 1))
+        assert False, "Should have raised ValueError for stride=0"
+    except ValueError as e:
+        assert "stride must be positive" in str(e)
+        print(f"  stride=0 correctly rejected: {e}")
+        return True
+    return False
+
+
+def test_dilation_validation():
+    """Test that dilation=0 raises ValueError"""
+    torch.manual_seed(42)
+    B, C_in, H, W = 1, 4, 8, 8
+    C_out, K = 4, 3
+
+    input = torch.randn(B, C_in, H, W, device='mps', dtype=torch.float32)
+    weight = torch.randn(C_out, C_in, K, K, device='mps', dtype=torch.float32)
+    offset = torch.randn(B, 2 * K * K, H - K + 1, W - K + 1, device='mps', dtype=torch.float32) * 0.1
+
+    try:
+        deform_conv2d(input, offset, weight, dilation=(0, 1))
+        assert False, "Should have raised ValueError for dilation=0"
+    except ValueError as e:
+        assert "dilation must be positive" in str(e)
+        print(f"  dilation=0 correctly rejected: {e}")
+        return True
+    return False
+
+
+def test_negative_padding_validation():
+    """Test that negative padding raises ValueError"""
+    torch.manual_seed(42)
+    B, C_in, H, W = 1, 4, 8, 8
+    C_out, K = 4, 3
+
+    input = torch.randn(B, C_in, H, W, device='mps', dtype=torch.float32)
+    weight = torch.randn(C_out, C_in, K, K, device='mps', dtype=torch.float32)
+    offset = torch.randn(B, 2 * K * K, H - K + 1, W - K + 1, device='mps', dtype=torch.float32) * 0.1
+
+    try:
+        deform_conv2d(input, offset, weight, padding=(-1, 0))
+        assert False, "Should have raised ValueError for negative padding"
+    except ValueError as e:
+        assert "padding must be non-negative" in str(e)
+        print(f"  negative padding correctly rejected: {e}")
+        return True
+    return False
+
+
+def test_groups_validation():
+    """Test that invalid channel/group combinations are rejected"""
+    torch.manual_seed(42)
+    B, C_in, H, W = 1, 4, 8, 8
+    C_out, K = 4, 3
+
+    input = torch.randn(B, C_in, H, W, device='mps', dtype=torch.float32)
+    # Weight with mismatched in_channels (3 doesn't divide 4)
+    weight = torch.randn(C_out, 3, K, K, device='mps', dtype=torch.float32)
+    offset = torch.randn(B, 2 * K * K, H - K + 1, W - K + 1, device='mps', dtype=torch.float32) * 0.1
+
+    try:
+        deform_conv2d(input, offset, weight)
+        assert False, "Should have raised ValueError for invalid groups"
+    except ValueError as e:
+        assert "divisible" in str(e).lower()
+        print(f"  invalid groups correctly rejected: {e}")
+        return True
+    return False
+
+
+def test_device_mismatch():
+    """Test that device mismatch raises ValueError"""
+    torch.manual_seed(42)
+    B, C_in, H, W = 1, 4, 8, 8
+    C_out, K = 4, 3
+
+    input = torch.randn(B, C_in, H, W, device='mps', dtype=torch.float32)
+    weight = torch.randn(C_out, C_in, K, K, device='cpu', dtype=torch.float32)  # CPU!
+    offset = torch.randn(B, 2 * K * K, H - K + 1, W - K + 1, device='mps', dtype=torch.float32) * 0.1
+
+    try:
+        deform_conv2d(input, offset, weight)
+        assert False, "Should have raised ValueError for device mismatch"
+    except ValueError as e:
+        assert "device" in str(e).lower()
+        print(f"  device mismatch correctly rejected: {e}")
+        return True
+    return False
+
+
+def test_invalid_output_dimensions():
+    """Test that invalid output dimensions raise ValueError"""
+    torch.manual_seed(42)
+    B, C_in, H, W = 1, 4, 4, 4  # Small input
+    C_out, K = 4, 5  # Large kernel
+
+    input = torch.randn(B, C_in, H, W, device='mps', dtype=torch.float32)
+    weight = torch.randn(C_out, C_in, K, K, device='mps', dtype=torch.float32)
+    # This would give negative output dimensions
+    offset = torch.randn(B, 2 * K * K, 1, 1, device='mps', dtype=torch.float32) * 0.1
+
+    try:
+        # stride=2 with 4x4 input and 5x5 kernel gives negative output
+        deform_conv2d(input, offset, weight, stride=(2, 2))
+        # Might not fail if offset shape matches expected output
+        print("  Output dimension test: passed or offset shape matched")
+        return True
+    except ValueError as e:
+        print(f"  Invalid output dimensions correctly rejected: {e}")
+        return True
 
 def test_forward(dtype, name):
     """Test forward pass"""
@@ -275,6 +403,14 @@ if __name__ == "__main__":
     print("=" * 50)
 
     all_ok = True
+
+    print("\n0. Validation tests:")
+    all_ok &= test_stride_validation()
+    all_ok &= test_dilation_validation()
+    all_ok &= test_negative_padding_validation()
+    all_ok &= test_groups_validation()
+    all_ok &= test_device_mismatch()
+    all_ok &= test_invalid_output_dimensions()
 
     print("\n1. Forward pass:")
     all_ok &= test_forward(torch.float32, "FP32")

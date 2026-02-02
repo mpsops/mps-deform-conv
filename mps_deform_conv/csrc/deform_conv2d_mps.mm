@@ -12,9 +12,15 @@
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 
+#include <mutex>
+#include <atomic>
+
 // =============================================================================
-// Metal Kernel Cache
+// Metal Kernel Cache (Thread-Safe)
 // =============================================================================
+
+static std::mutex g_init_mutex;
+static std::atomic<bool> g_initialized{false};
 
 static id<MTLDevice> g_device = nil;
 static id<MTLLibrary> g_library = nil;
@@ -436,7 +442,18 @@ kernel void deformable_col2im_coord_fp32(
 }
 
 static bool init_metal() {
-    if (g_device) return true;
+    // Fast path: already initialized
+    if (g_initialized.load(std::memory_order_acquire)) {
+        return true;
+    }
+
+    // Slow path: acquire lock and initialize
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+
+    // Double-check after acquiring lock
+    if (g_initialized.load(std::memory_order_relaxed)) {
+        return true;
+    }
 
     @autoreleasepool {
         g_device = MTLCreateSystemDefaultDevice();
@@ -474,6 +491,9 @@ static bool init_metal() {
         g_col2im_fp32 = create_pipeline(@"deformable_col2im_fp32");
         g_col2im_coord_fp32 = create_pipeline(@"deformable_col2im_coord_fp32");
         // No FP16 backward kernels - use FP32 and convert
+
+        // Mark as initialized with release semantics
+        g_initialized.store(true, std::memory_order_release);
     }
 
     return true;
@@ -482,6 +502,13 @@ static bool init_metal() {
 // =============================================================================
 // Forward Pass
 // =============================================================================
+
+// Helper to check for int32 overflow in size calculations
+static void check_size_overflow(int64_t size, const char* name) {
+    constexpr int64_t INT32_MAX_VAL = 2147483647LL;
+    TORCH_CHECK(size <= INT32_MAX_VAL,
+        name, " (", size, ") exceeds int32 limit. Reduce tensor dimensions.");
+}
 
 at::Tensor deform_conv2d_forward_mps(
     const at::Tensor& input,
@@ -496,9 +523,23 @@ at::Tensor deform_conv2d_forward_mps(
     int64_t n_offset_grps,
     bool use_mask
 ) {
+    // Device validation
     TORCH_CHECK(input.device().is_mps(), "input must be on MPS");
     TORCH_CHECK(weight.device().is_mps(), "weight must be on MPS");
     TORCH_CHECK(offset.device().is_mps(), "offset must be on MPS");
+    if (use_mask && mask.numel() > 0) {
+        TORCH_CHECK(mask.device().is_mps(), "mask must be on MPS");
+    }
+    if (bias.numel() > 0) {
+        TORCH_CHECK(bias.device().is_mps(), "bias must be on MPS");
+    }
+
+    // Parameter validation
+    TORCH_CHECK(stride_h > 0 && stride_w > 0, "stride must be positive");
+    TORCH_CHECK(dilation_h > 0 && dilation_w > 0, "dilation must be positive");
+    TORCH_CHECK(pad_h >= 0 && pad_w >= 0, "padding must be non-negative");
+    TORCH_CHECK(n_weight_grps > 0, "n_weight_grps must be positive");
+    TORCH_CHECK(n_offset_grps > 0, "n_offset_grps must be positive");
 
     init_metal();
 
@@ -513,6 +554,17 @@ at::Tensor deform_conv2d_forward_mps(
 
     const int64_t out_h = (in_h + 2 * pad_h - (dilation_h * (weight_h - 1) + 1)) / stride_h + 1;
     const int64_t out_w = (in_w + 2 * pad_w - (dilation_w * (weight_w - 1) + 1)) / stride_w + 1;
+
+    // Validate output dimensions
+    TORCH_CHECK(out_h > 0 && out_w > 0,
+        "Invalid output dimensions: out_h=", out_h, ", out_w=", out_w,
+        ". Check stride/padding/dilation values.");
+
+    // Check for int32 overflow in kernel dispatch sizes
+    int64_t num_kernels = n_in_channels * out_h * out_w * batch_sz;
+    check_size_overflow(num_kernels, "num_kernels");
+    check_size_overflow(n_in_channels * weight_h * weight_w, "column_height");
+    check_size_overflow(batch_sz * out_h * out_w, "column_width");
 
     // Allocate column buffer
     auto columns = at::empty(
@@ -673,7 +725,18 @@ at::Tensor deformable_im2col_mps(
     int64_t n_offset_grps,
     bool use_mask
 ) {
+    // Device validation
     TORCH_CHECK(input.device().is_mps(), "input must be on MPS");
+    TORCH_CHECK(offset.device().is_mps(), "offset must be on MPS");
+    if (use_mask && mask.numel() > 0) {
+        TORCH_CHECK(mask.device().is_mps(), "mask must be on MPS");
+    }
+
+    // Parameter validation
+    TORCH_CHECK(stride_h > 0 && stride_w > 0, "stride must be positive");
+    TORCH_CHECK(dilation_h > 0 && dilation_w > 0, "dilation must be positive");
+    TORCH_CHECK(kernel_h > 0 && kernel_w > 0, "kernel_size must be positive");
+    TORCH_CHECK(n_offset_grps > 0, "n_offset_grps must be positive");
 
     init_metal();
 
@@ -798,6 +861,20 @@ at::Tensor deform_conv2d_backward_input_mps(
     int64_t n_offset_grps,
     bool use_mask
 ) {
+    // Device validation
+    TORCH_CHECK(grad_col.device().is_mps(), "grad_col must be on MPS");
+    TORCH_CHECK(input.device().is_mps(), "input must be on MPS");
+    TORCH_CHECK(offset.device().is_mps(), "offset must be on MPS");
+    if (use_mask && mask.numel() > 0) {
+        TORCH_CHECK(mask.device().is_mps(), "mask must be on MPS");
+    }
+
+    // Parameter validation
+    TORCH_CHECK(stride_h > 0 && stride_w > 0, "stride must be positive");
+    TORCH_CHECK(dilation_h > 0 && dilation_w > 0, "dilation must be positive");
+    TORCH_CHECK(kernel_h > 0 && kernel_w > 0, "kernel_size must be positive");
+    TORCH_CHECK(n_offset_grps > 0, "n_offset_grps must be positive");
+
     init_metal();
 
     const int64_t batch_sz = input.size(0);
@@ -916,6 +993,20 @@ std::tuple<at::Tensor, at::Tensor> deform_conv2d_backward_offset_mask_mps(
     int64_t n_offset_grps,
     bool use_mask
 ) {
+    // Device validation
+    TORCH_CHECK(grad_col.device().is_mps(), "grad_col must be on MPS");
+    TORCH_CHECK(input.device().is_mps(), "input must be on MPS");
+    TORCH_CHECK(offset.device().is_mps(), "offset must be on MPS");
+    if (use_mask && mask.numel() > 0) {
+        TORCH_CHECK(mask.device().is_mps(), "mask must be on MPS");
+    }
+
+    // Parameter validation
+    TORCH_CHECK(stride_h > 0 && stride_w > 0, "stride must be positive");
+    TORCH_CHECK(dilation_h > 0 && dilation_w > 0, "dilation must be positive");
+    TORCH_CHECK(kernel_h > 0 && kernel_w > 0, "kernel_size must be positive");
+    TORCH_CHECK(n_offset_grps > 0, "n_offset_grps must be positive");
+
     init_metal();
 
     const int64_t batch_sz = input.size(0);
