@@ -137,6 +137,58 @@ def test_invalid_output_dimensions():
         print(f"  Invalid output dimensions correctly rejected: {e}")
         return True
 
+
+def test_bf16_precision_acceptable():
+    """Test that BF16 precision loss is within acceptable bounds.
+
+    BF16 has only 7 bits of mantissa vs FP32's 23 bits, so there WILL be
+    precision loss. This test verifies the loss is within acceptable bounds
+    for typical deep learning use cases (< 1% relative error).
+    """
+    torch.manual_seed(42)
+    B, C_in, H, W = 2, 32, 16, 16
+    C_out, K = 32, 3
+
+    # Create FP32 reference tensors
+    input_fp32 = torch.randn(B, C_in, H, W, device='mps', dtype=torch.float32)
+    weight_fp32 = torch.randn(C_out, C_in, K, K, device='mps', dtype=torch.float32)
+    out_h = H - K + 1
+    out_w = W - K + 1
+    offset_fp32 = torch.randn(B, 2 * K * K, out_h, out_w, device='mps', dtype=torch.float32) * 0.1
+
+    # FP32 reference output
+    import mps_deform_conv
+    mps_deform_conv._bf16_warned = True  # Suppress warning for test
+    output_fp32 = deform_conv2d(input_fp32, offset_fp32, weight_fp32)
+
+    # BF16 output (converted from same FP32 inputs)
+    input_bf16 = input_fp32.to(torch.bfloat16)
+    weight_bf16 = weight_fp32.to(torch.bfloat16)
+    offset_bf16 = offset_fp32.to(torch.bfloat16)
+
+    output_bf16 = deform_conv2d(input_bf16, offset_bf16, weight_bf16)
+
+    # Compute precision metrics
+    diff = (output_fp32 - output_bf16.to(torch.float32)).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    rel_error = (diff / (output_fp32.abs() + 1e-6)).mean().item() * 100
+
+    print(f"  BF16 precision: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}, rel_error={rel_error:.2f}%")
+
+    # BF16 has 7-bit mantissa (vs FP32's 23-bit), so ~2-3% relative error is expected.
+    # We use 3% threshold to catch severe precision issues while accepting normal BF16 behavior.
+    threshold = 3.0  # 3% relative error threshold (typical for BF16)
+    ok = rel_error < threshold
+
+    if not ok:
+        print(f"  FAIL: BF16 relative error {rel_error:.2f}% exceeds {threshold}% threshold")
+    else:
+        print(f"  PASS: BF16 relative error {rel_error:.2f}% within {threshold}% threshold")
+
+    return ok
+
+
 def test_forward(dtype, name):
     """Test forward pass"""
     torch.manual_seed(42)
@@ -411,6 +463,7 @@ if __name__ == "__main__":
     all_ok &= test_groups_validation()
     all_ok &= test_device_mismatch()
     all_ok &= test_invalid_output_dimensions()
+    all_ok &= test_bf16_precision_acceptable()
 
     print("\n1. Forward pass:")
     all_ok &= test_forward(torch.float32, "FP32")

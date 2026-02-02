@@ -26,6 +26,7 @@ static id<MTLDevice> g_device = nil;
 static id<MTLLibrary> g_library = nil;
 static id<MTLComputePipelineState> g_im2col_fp32 = nil;
 static id<MTLComputePipelineState> g_im2col_fp16 = nil;
+static id<MTLComputePipelineState> g_im2col_bf16 = nil;
 static id<MTLComputePipelineState> g_col2im_fp32 = nil;
 static id<MTLComputePipelineState> g_col2im_coord_fp32 = nil;
 // Note: No FP16 backward kernels - Metal doesn't have atomic_half, so we use FP32 for backward
@@ -34,23 +35,6 @@ static NSString* get_metal_source() {
     return @R"(
 #include <metal_stdlib>
 using namespace metal;
-
-// Atomic float add using compare-and-swap (works on all Metal versions)
-// This is the standard workaround when atomic_float is not available
-inline void atomic_add_float(device atomic_uint* addr, float value) {
-    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
-    float current_val = as_type<float>(expected);
-    float new_val = current_val + value;
-    uint new_bits = as_type<uint>(new_val);
-
-    while (!atomic_compare_exchange_weak_explicit(
-        addr, &expected, new_bits,
-        memory_order_relaxed, memory_order_relaxed)) {
-        current_val = as_type<float>(expected);
-        new_val = current_val + value;
-        new_bits = as_type<uint>(new_val);
-    }
-}
 
 // Bilinear interpolation
 template<typename T>
@@ -260,13 +244,108 @@ kernel void deformable_im2col_fp16(
     }
 }
 
+// Forward: im2col with deformable offsets - BF16 with FP32 accumulation for precision
+kernel void deformable_im2col_bf16(
+    device const bfloat* input       [[buffer(0)]],
+    device const bfloat* offset      [[buffer(1)]],
+    device const bfloat* mask        [[buffer(2)]],
+    device bfloat* columns           [[buffer(3)]],
+    constant int& height            [[buffer(4)]],
+    constant int& width             [[buffer(5)]],
+    constant int& weight_h          [[buffer(6)]],
+    constant int& weight_w          [[buffer(7)]],
+    constant int& pad_h             [[buffer(8)]],
+    constant int& pad_w             [[buffer(9)]],
+    constant int& stride_h          [[buffer(10)]],
+    constant int& stride_w          [[buffer(11)]],
+    constant int& dilation_h        [[buffer(12)]],
+    constant int& dilation_w        [[buffer(13)]],
+    constant int& batch_sz          [[buffer(14)]],
+    constant int& n_in_channels     [[buffer(15)]],
+    constant int& n_offset_grps     [[buffer(16)]],
+    constant int& out_h             [[buffer(17)]],
+    constant int& out_w             [[buffer(18)]],
+    constant int& use_mask          [[buffer(19)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    int n = n_in_channels * out_h * out_w * batch_sz;
+    if (int(gid) >= n) return;
+
+    int index = int(gid);
+    int out_x = index % out_w;
+    int out_y = (index / out_w) % out_h;
+    int out_b = (index / (out_w * out_h)) % batch_sz;
+    int in_c = index / (out_w * out_h * batch_sz);
+    int out_c = in_c * weight_h * weight_w;
+
+    int c_per_offset_grp = n_in_channels / n_offset_grps;
+    int grp_idx = in_c / c_per_offset_grp;
+
+    device bfloat* col_ptr = columns +
+        (out_c * (batch_sz * out_h * out_w) + out_b * (out_h * out_w) +
+         out_y * out_w + out_x);
+
+    device const bfloat* in_ptr = input +
+        (out_b * (n_in_channels * height * width) + in_c * (height * width));
+
+    device const bfloat* offset_ptr = offset +
+        (out_b * n_offset_grps + grp_idx) * 2 * weight_h * weight_w * out_h * out_w;
+
+    device const bfloat* mask_ptr = mask +
+        (out_b * n_offset_grps + grp_idx) * weight_h * weight_w * out_h * out_w;
+
+    for (int i = 0; i < weight_h; ++i) {
+        for (int j = 0; j < weight_w; ++j) {
+            int mask_idx = i * weight_w + j;
+            int offset_idx = 2 * mask_idx;
+
+            // Read BF16 values and convert to FP32 for computation
+            float mask_value = 1.0f;
+            if (use_mask) {
+                mask_value = float(mask_ptr[mask_idx * (out_h * out_w) + out_y * out_w + out_x]);
+            }
+
+            float offset_h_f = float(offset_ptr[offset_idx * (out_h * out_w) + out_y * out_w + out_x]);
+            float offset_w_f = float(offset_ptr[(offset_idx + 1) * (out_h * out_w) + out_y * out_w + out_x]);
+
+            float y = float(out_y * stride_h - pad_h) + float(i * dilation_h) + offset_h_f;
+            float x = float(out_x * stride_w - pad_w) + float(j * dilation_w) + offset_w_f;
+
+            // Bilinear interpolation in FP32 for precision
+            float result = 0.0f;
+            if (y > -1.0f && float(height) > y && x > -1.0f && float(width) > x) {
+                int h_low = int(floor(y));
+                int w_low = int(floor(x));
+                int h_high = h_low + 1;
+                int w_high = w_low + 1;
+
+                float lh = y - float(h_low);
+                float lw = x - float(w_low);
+                float hh = 1.0f - lh;
+                float hw = 1.0f - lw;
+
+                float v1 = (h_low >= 0 && w_low >= 0) ? float(in_ptr[h_low * width + w_low]) : 0.0f;
+                float v2 = (h_low >= 0 && w_high <= width - 1) ? float(in_ptr[h_low * width + w_high]) : 0.0f;
+                float v3 = (h_high <= height - 1 && w_low >= 0) ? float(in_ptr[h_high * width + w_low]) : 0.0f;
+                float v4 = (h_high <= height - 1 && w_high <= width - 1) ? float(in_ptr[h_high * width + w_high]) : 0.0f;
+
+                result = hh * hw * v1 + hh * lw * v2 + lh * hw * v3 + lh * lw * v4;
+            }
+
+            // Store result as BF16
+            *col_ptr = bfloat(mask_value * result);
+            col_ptr += batch_sz * out_h * out_w;
+        }
+    }
+}
+
 // Backward: col2im for input gradients
-// Uses atomic_uint with CAS loop for compatibility with all Metal versions
+// Uses native atomic_float for optimal performance on Apple Silicon
 kernel void deformable_col2im_fp32(
     device const float* col         [[buffer(0)]],
     device const float* offset      [[buffer(1)]],
     device const float* mask        [[buffer(2)]],
-    device atomic_uint* grad_im     [[buffer(3)]],
+    device atomic_float* grad_im    [[buffer(3)]],
     constant int& channels          [[buffer(4)]],
     constant int& height            [[buffer(5)]],
     constant int& width             [[buffer(6)]],
@@ -331,7 +410,7 @@ kernel void deformable_col2im_fp32(
                 int grad_pos = ((b * channels + c) * height + yp) * width + xp;
                 float weight = (1.0f - abs(y - float(yp))) * (1.0f - abs(x - float(xp)));
 
-                atomic_add_float(&grad_im[grad_pos], mask_value * weight * col_val);
+                atomic_fetch_add_explicit(&grad_im[grad_pos], mask_value * weight * col_val, memory_order_relaxed);
             }
         }
     }
@@ -488,6 +567,7 @@ static bool init_metal() {
 
         g_im2col_fp32 = create_pipeline(@"deformable_im2col_fp32");
         g_im2col_fp16 = create_pipeline(@"deformable_im2col_fp16");
+        g_im2col_bf16 = create_pipeline(@"deformable_im2col_bf16");
         g_col2im_fp32 = create_pipeline(@"deformable_col2im_fp32");
         g_col2im_coord_fp32 = create_pipeline(@"deformable_col2im_coord_fp32");
         // No FP16 backward kernels - use FP32 and convert
@@ -581,7 +661,7 @@ at::Tensor deform_conv2d_forward_mps(
         );
     }
 
-    // Handle BF16: convert to FP32 for kernel, convert output back
+    // Native support for FP32, FP16, BF16 - no conversion needed
     bool is_bfloat16 = input.scalar_type() == at::kBFloat16;
     at::ScalarType orig_dtype = input.scalar_type();
 
@@ -589,26 +669,20 @@ at::Tensor deform_conv2d_forward_mps(
     auto offset_contig = offset.contiguous();
     auto mask_contig = mask_tensor.contiguous();
 
-    // Convert BF16 to FP32 for kernel execution
-    if (is_bfloat16) {
-        input_contig = input_contig.to(at::kFloat);
-        offset_contig = offset_contig.to(at::kFloat);
-        mask_contig = mask_contig.to(at::kFloat);
-        // Reallocate columns in FP32
-        columns = at::empty(
-            {n_in_channels * weight_h * weight_w, batch_sz * out_h * out_w},
-            input_contig.options()
-        );
-    }
-
     // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        // Select kernel based on dtype (BF16 already converted to FP32 above)
-        bool use_fp16 = input_contig.scalar_type() == at::kHalf;
-        auto pipeline = use_fp16 ? g_im2col_fp16 : g_im2col_fp32;
+        // Select kernel based on dtype - native support for all types
+        id<MTLComputePipelineState> pipeline;
+        if (input_contig.scalar_type() == at::kHalf) {
+            pipeline = g_im2col_fp16;
+        } else if (input_contig.scalar_type() == at::kBFloat16) {
+            pipeline = g_im2col_bf16;
+        } else {
+            pipeline = g_im2col_fp32;
+        }
         [encoder setComputePipelineState:pipeline];
 
         // Set buffers
@@ -669,10 +743,9 @@ at::Tensor deform_conv2d_forward_mps(
     // Reshape columns and perform matrix multiplication with weights
     // columns: [n_in_channels * weight_h * weight_w, batch_sz * out_h * out_w]
     // weight: [n_out_channels, n_in_channels / n_weight_grps, weight_h, weight_w]
+    // Both columns and weight stay in their native dtype (FP32/FP16/BF16)
 
-    // For BF16, weight also needs to be converted to match columns dtype
-    auto weight_for_mm = is_bfloat16 ? weight.to(at::kFloat) : weight;
-    auto weight_flat = weight_for_mm.view({n_out_channels, -1});  // [out_ch, in_ch * kh * kw]
+    auto weight_flat = weight.view({n_out_channels, -1});  // [out_ch, in_ch * kh * kw]
 
     // Perform grouped matmul if needed
     at::Tensor output;
@@ -696,15 +769,9 @@ at::Tensor deform_conv2d_forward_mps(
                    .permute({1, 0, 2, 3})
                    .contiguous();
 
-    // Add bias
+    // Add bias (same dtype as output)
     if (bias.defined() && bias.numel() > 0) {
-        auto bias_for_add = is_bfloat16 ? bias.to(at::kFloat) : bias;
-        output = output + bias_for_add.view({1, -1, 1, 1});
-    }
-
-    // Convert output back to original dtype (BF16)
-    if (is_bfloat16) {
-        output = output.to(orig_dtype);
+        output = output + bias.view({1, -1, 1, 1});
     }
 
     return output;
@@ -748,10 +815,7 @@ at::Tensor deformable_im2col_mps(
     const int64_t out_h = (in_h + 2 * pad_h - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
     const int64_t out_w = (in_w + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
 
-    // Handle BF16: convert to FP32 for kernel
-    bool is_bfloat16 = input.scalar_type() == at::kBFloat16;
-    at::ScalarType orig_dtype = input.scalar_type();
-
+    // Native support for FP32, FP16, BF16 - no conversion needed
     auto input_work = input.contiguous();
     auto offset_work = offset.contiguous();
 
@@ -762,14 +826,7 @@ at::Tensor deformable_im2col_mps(
     }
     auto mask_work = mask_tensor.contiguous();
 
-    // Convert BF16 to FP32 for kernel execution
-    if (is_bfloat16) {
-        input_work = input_work.to(at::kFloat);
-        offset_work = offset_work.to(at::kFloat);
-        mask_work = mask_work.to(at::kFloat);
-    }
-
-    // Allocate columns in working dtype
+    // Allocate columns in same dtype as input
     auto columns = at::empty(
         {n_in_channels * kernel_h * kernel_w, batch_sz * out_h * out_w},
         input_work.options()
@@ -780,8 +837,15 @@ at::Tensor deformable_im2col_mps(
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        bool use_fp16 = input_work.scalar_type() == at::kHalf;
-        auto pipeline = use_fp16 ? g_im2col_fp16 : g_im2col_fp32;
+        // Select kernel based on dtype - native support for all types
+        id<MTLComputePipelineState> pipeline;
+        if (input_work.scalar_type() == at::kHalf) {
+            pipeline = g_im2col_fp16;
+        } else if (input_work.scalar_type() == at::kBFloat16) {
+            pipeline = g_im2col_bf16;
+        } else {
+            pipeline = g_im2col_fp32;
+        }
         [encoder setComputePipelineState:pipeline];
 
         id<MTLBuffer> input_buf = at::native::mps::getMTLBufferStorage(input_work);
@@ -834,11 +898,6 @@ at::Tensor deformable_im2col_mps(
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
         // No endEncoding/commit - PyTorch manages encoder lifecycle
-    }
-
-    // Convert back to original dtype if needed
-    if (is_bfloat16) {
-        columns = columns.to(orig_dtype);
     }
 
     return columns;
