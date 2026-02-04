@@ -567,7 +567,17 @@ static bool init_metal() {
 
         g_im2col_fp32 = create_pipeline(@"deformable_im2col_fp32");
         g_im2col_fp16 = create_pipeline(@"deformable_im2col_fp16");
-        g_im2col_bf16 = create_pipeline(@"deformable_im2col_bf16");
+
+        // Try to compile BF16 kernel - only available on Metal 3.1+ (macOS 14+)
+        // Gracefully fallback to FP32 if bfloat type is not supported
+        @try {
+            g_im2col_bf16 = create_pipeline(@"deformable_im2col_bf16");
+        } @catch (NSException *exception) {
+            NSLog(@"⚠️  BF16 kernel compilation failed (Metal doesn't support bfloat type). "
+                  @"BF16 inputs will be converted to FP32. Upgrade to macOS 14+ for native BF16 support.");
+            g_im2col_bf16 = nil;  // Mark as unavailable
+        }
+
         g_col2im_fp32 = create_pipeline(@"deformable_col2im_fp32");
         g_col2im_coord_fp32 = create_pipeline(@"deformable_col2im_coord_fp32");
         // No FP16 backward kernels - use FP32 and convert
@@ -646,11 +656,10 @@ at::Tensor deform_conv2d_forward_mps(
     check_size_overflow(n_in_channels * weight_h * weight_w, "column_height");
     check_size_overflow(batch_sz * out_h * out_w, "column_width");
 
-    // Allocate column buffer
-    auto columns = at::empty(
-        {n_in_channels * weight_h * weight_w, batch_sz * out_h * out_w},
-        input.options()
-    );
+    // Check if BF16 kernel is available, fallback to FP32 if not
+    at::ScalarType orig_dtype = input.scalar_type();
+    bool is_bfloat16 = (orig_dtype == at::kBFloat16);
+    bool bf16_fallback = (is_bfloat16 && g_im2col_bf16 == nil);
 
     // Handle mask
     at::Tensor mask_tensor = mask;
@@ -661,25 +670,33 @@ at::Tensor deform_conv2d_forward_mps(
         );
     }
 
-    // Native support for FP32, FP16, BF16 - no conversion needed
-    bool is_bfloat16 = input.scalar_type() == at::kBFloat16;
-    at::ScalarType orig_dtype = input.scalar_type();
+    // Convert BF16 to FP32 if BF16 kernel unavailable (old Metal versions)
+    auto input_work = bf16_fallback ? input.to(at::kFloat) : input;
+    auto offset_work = bf16_fallback ? offset.to(at::kFloat) : offset;
+    auto mask_work = bf16_fallback ? mask_tensor.to(at::kFloat) : mask_tensor;
 
-    auto input_contig = input.contiguous();
-    auto offset_contig = offset.contiguous();
-    auto mask_contig = mask_tensor.contiguous();
+    // Allocate column buffer (use working dtype for BF16 fallback)
+    auto columns = at::empty(
+        {n_in_channels * weight_h * weight_w, batch_sz * out_h * out_w},
+        input_work.options()
+    );
+
+    auto input_contig = input_work.contiguous();
+    auto offset_contig = offset_work.contiguous();
+    auto mask_contig = mask_work.contiguous();
 
     // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        // Select kernel based on dtype - native support for all types
+        // Select kernel based on dtype
+        // Note: BF16 inputs already converted to FP32 earlier if BF16 kernel unavailable
         id<MTLComputePipelineState> pipeline;
         if (input_contig.scalar_type() == at::kHalf) {
             pipeline = g_im2col_fp16;
         } else if (input_contig.scalar_type() == at::kBFloat16) {
-            pipeline = g_im2col_bf16;
+            pipeline = g_im2col_bf16;  // Only reached if BF16 kernel available
         } else {
             pipeline = g_im2col_fp32;
         }
@@ -774,6 +791,11 @@ at::Tensor deform_conv2d_forward_mps(
         output = output + bias.view({1, -1, 1, 1});
     }
 
+    // Convert back to BF16 if we did fallback conversion
+    if (bf16_fallback) {
+        output = output.to(orig_dtype);
+    }
+
     return output;
 }
 
@@ -815,18 +837,23 @@ at::Tensor deformable_im2col_mps(
     const int64_t out_h = (in_h + 2 * pad_h - (dilation_h * (kernel_h - 1) + 1)) / stride_h + 1;
     const int64_t out_w = (in_w + 2 * pad_w - (dilation_w * (kernel_w - 1) + 1)) / stride_w + 1;
 
-    // Native support for FP32, FP16, BF16 - no conversion needed
-    auto input_work = input.contiguous();
-    auto offset_work = offset.contiguous();
+    // Check if BF16 kernel is available, fallback to FP32 if not
+    at::ScalarType orig_dtype = input.scalar_type();
+    bool is_bfloat16 = (orig_dtype == at::kBFloat16);
+    bool bf16_fallback = (is_bfloat16 && g_im2col_bf16 == nil);
 
     // Handle mask
     at::Tensor mask_tensor = mask;
     if (!use_mask || mask.numel() == 0) {
         mask_tensor = at::ones({batch_sz, n_offset_grps, kernel_h, kernel_w, out_h, out_w}, input.options());
     }
-    auto mask_work = mask_tensor.contiguous();
 
-    // Allocate columns in same dtype as input
+    // Convert BF16 to FP32 if BF16 kernel unavailable
+    auto input_work = bf16_fallback ? input.to(at::kFloat).contiguous() : input.contiguous();
+    auto offset_work = bf16_fallback ? offset.to(at::kFloat).contiguous() : offset.contiguous();
+    auto mask_work = bf16_fallback ? mask_tensor.to(at::kFloat).contiguous() : mask_tensor.contiguous();
+
+    // Allocate columns in working dtype
     auto columns = at::empty(
         {n_in_channels * kernel_h * kernel_w, batch_sz * out_h * out_w},
         input_work.options()
@@ -898,6 +925,11 @@ at::Tensor deformable_im2col_mps(
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
 
         // No endEncoding/commit - PyTorch manages encoder lifecycle
+    }
+
+    // Convert back to BF16 if we did fallback conversion
+    if (bf16_fallback) {
+        return columns.to(orig_dtype);
     }
 
     return columns;

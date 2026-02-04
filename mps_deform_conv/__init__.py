@@ -12,7 +12,7 @@ import math
 import threading
 import warnings
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 
 # Thread-safe library loading
 _lib_lock = threading.Lock()
@@ -195,9 +195,8 @@ class _DeformConv2dFunction(torch.autograd.Function):
         if mask is not None:
             _check_tensor_device(mask, "mask", expected_device)
 
-        # BF16 warning
-        if input.dtype == torch.bfloat16:
-            _warn_bf16_conversion()
+        # BF16 is now supported natively on Metal 3.1+ (macOS 14+)
+        # On older Metal versions, the C++ backend automatically falls back to FP32
 
         # Get dimensions for overflow check
         batch_sz = input.size(0)

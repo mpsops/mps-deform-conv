@@ -59,7 +59,7 @@ def get_extensions():
 
 setup(
     name="mps-deform-conv",
-    version="0.2.0",
+    version="0.2.2",
     description="Deformable Convolution 2D for PyTorch on Apple Silicon (MPS)",
     author="imperatormk",
     packages=["mps_deform_conv"],
